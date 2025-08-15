@@ -32,7 +32,7 @@ vectorizer, model = load_models()
 # ------------------------
 # APP TITLE
 # ------------------------
-st.title("🛠 Smart Ad Classifier – Craigslist Computer Listings")
+st.title("Smart Ad Classifier – Craigslist Computer Listings")
 st.markdown(
     """
     This tool classifies Craigslist listings into **"Computer"** or **"Computer Part"** using a 
