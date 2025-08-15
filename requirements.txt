@@ -3,6 +3,8 @@ pandas
 numpy
 scikit-learn
 joblib
+matplotlib
+seaborn
 selenium
 webdriver-manager
 beautifulsoup4
