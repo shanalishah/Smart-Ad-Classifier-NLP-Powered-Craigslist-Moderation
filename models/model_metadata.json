@@ -1,0 +1,5 @@
+{
+  "positive_class": "computers",
+  "decision_threshold": 0.51,
+  "C": 0.5
+}
