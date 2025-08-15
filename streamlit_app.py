@@ -14,8 +14,8 @@ st.set_page_config(
 # ------------------------
 # LOAD PRETRAINED MODELS
 # ------------------------
-VEC_PATH = "data/tfidf_vectorizer.pkl"
-MODEL_PATH = "data/final_logistic_model.pkl"
+VEC_PATH = "models/tfidf_vectorizer.pkl"
+MODEL_PATH = "models/final_logistic_model.pkl"
 
 @st.cache_resource
 def load_models():
