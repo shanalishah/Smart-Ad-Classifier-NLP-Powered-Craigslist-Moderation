@@ -18,7 +18,12 @@ st.set_page_config(
 )
 
 # ------------------------
-# MODEL PATH (your saved LR trained on 25 keywords)
+# THRESHOLD (adjust if needed)
+# ------------------------
+THRESHOLD = 0.50  # probability needed to label as "Computer"; else "Computer Part"
+
+# ------------------------
+# MODEL PATH (saved LR trained on 25 keywords)
 # ------------------------
 MODEL_PATH = Path("models/final_logistic_model.pkl")
 
@@ -206,7 +211,7 @@ def classify_texts(texts: List[str], threshold: float) -> pd.DataFrame:
         override = _rule_override(t)
         if override == "parts":
             is_comp = False
-            conf = max(0.85, 1.0 - p)  # show high confidence without claiming 100%
+            conf = max(0.85, 1.0 - p)  # high confidence without claiming 100%
         elif override == "computers":
             is_comp = True
             conf = max(0.85, p)
@@ -234,7 +239,6 @@ tab1, tab2 = st.tabs(["💬 Quick Test", "📂 Bulk Classification (CSV)"])
 with tab1:
     st.subheader("Quick Test – Classify a Single Listing")
     st.markdown("Enter a product title or description to see the predicted category and confidence.")
-    threshold_demo = st.slider("Decision threshold (p = Computer)", 0.10, 0.90, 0.50, 0.01, key="thr_demo")
 
     user_input = st.text_area(
         "Listing text:",
@@ -243,7 +247,7 @@ with tab1:
 
     if st.button("Classify Listing", key="btn_single_classify"):
         if user_input.strip():
-            df_out = classify_texts([user_input], threshold_demo)
+            df_out = classify_texts([user_input], THRESHOLD)
             row = df_out.iloc[0]
             st.success(f"**Prediction:** {row['predicted_label']}")
             st.info(f"Confidence: {row['confidence']:.2%}")
@@ -256,7 +260,6 @@ with tab1:
 with tab2:
     st.subheader("Bulk Classification – Upload a CSV File")
     st.markdown("Upload a CSV with a **`text`** column (or **`title` + `description`**).")
-    threshold_bulk = st.slider("Decision threshold (p = Computer) for bulk", 0.10, 0.90, 0.50, 0.01, key="thr_bulk")
 
     uploaded_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_upload")
 
@@ -265,7 +268,7 @@ with tab2:
             df_raw = pd.read_csv(uploaded_file)
             df_in = normalize_input(df_raw)
 
-            df_out = classify_texts(df_in["text"].tolist(), threshold_bulk)
+            df_out = classify_texts(df_in["text"].tolist(), THRESHOLD)
 
             show = pd.concat(
                 [df_in.reset_index(drop=True), df_out[["predicted_label", "confidence"]]],
