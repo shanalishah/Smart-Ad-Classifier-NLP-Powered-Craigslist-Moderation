@@ -74,12 +74,9 @@ pipe = load_pipeline()
 def resolve_idx_pos(pipeline: Pipeline) -> int:
     clf = pipeline.named_steps["clf"]
     classes = list(getattr(clf, "classes_", []))
-
-    # If labels are strings and include 'computers', use directly
     if classes and all(isinstance(c, str) for c in classes) and "computers" in classes:
         return classes.index("computers")
-
-    # Otherwise infer via a quick probe
+    # Probe-based inference
     probe_comp = ["apple macbook pro 16 inch", "dell xps 13 laptop"]
     probe_part = ["rtx 3060 graphics card", "corsair 750w psu power supply"]
     p_comp = pipeline.predict_proba(probe_comp).mean(axis=0)
@@ -140,12 +137,53 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["text"].str.strip().ne("")].reset_index(drop=True)
     return out
 
+# --- Lexicons for gentle, human-readable nudges ---
+PARTS_STRONG = {
+    "gpu","graphics card","video card","graphics","rtx","gtx","radeon",
+    "psu","power supply","motherboard","mainboard","cpu","processor","heatsink","cooler",
+    "ram","memory","sodimm","ddr3","ddr4","ddr5",
+    "ssd","hdd","hard drive","nvme","sata","m.2",
+    "monitor","screen","keyboard","mouse","mice","printer","ink","toner",
+    "router","switch","cable","adapter","webcam","case","chassis","fan"
+}
+COMPUTERS_STRONG = {
+    "laptop","notebook","macbook","mac book","imac","mac mini","desktop","tower",
+    "gaming pc","prebuilt","all-in-one","aio","chromebook","computer","pc"
+}
+
+def _hit_any(text: str, vocab: set[str]) -> bool:
+    s = (text or "").lower()
+    return any(w in s for w in vocab)
+
+def _apply_prior_nudge(p_comp: np.ndarray, texts: list[str]) -> np.ndarray:
+    """
+    Adjust p(computers) slightly when we have a strong, unambiguous keyword signal.
+    - If looks like PART only -> nudge down (toward parts)
+    - If looks like COMPUTER only -> nudge up (toward computers)
+    Nudges are small so the model still dominates.
+    """
+    nudged = p_comp.copy()
+    for i, t in enumerate(texts):
+        part_hit = _hit_any(t, PARTS_STRONG)
+        comp_hit = _hit_any(t, COMPUTERS_STRONG)
+        if part_hit and not comp_hit:
+            nudged[i] = max(0.0, nudged[i] - 0.20)   # 20% nudge toward parts
+        elif comp_hit and not part_hit:
+            nudged[i] = min(1.0, nudged[i] + 0.20)   # 20% nudge toward computers
+        # both or neither -> no nudge
+    return nudged
+
 def classify_texts(texts: List[str], threshold: float) -> pd.DataFrame:
-    """Use probabilities only. p(computers) >= threshold -> Computer(s) else Computer Part(s)."""
-    proba = pipe.predict_proba(texts)[:, IDX_POS]  # p(computers)
-    is_comp = proba >= threshold
+    """
+    Probabilities only. p(computers) is nudged by simple rules so obvious
+    items like 'mouse' flip earlier without needing an extreme threshold.
+    """
+    p_comp_base = pipe.predict_proba(texts)[:, IDX_POS]  # base p(computers)
+    p_comp = _apply_prior_nudge(p_comp_base, texts)
+
+    is_comp = p_comp >= threshold
     labels = [pluralize(bool(c), detect_plurality(t)) for c, t in zip(is_comp, texts)]
-    conf = np.where(is_comp, proba, 1.0 - proba)
+    conf = np.where(is_comp, p_comp, 1.0 - p_comp)
 
     return pd.DataFrame({
         "text": texts,
