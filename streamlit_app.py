@@ -241,5 +241,4 @@ with tab2:
 st.markdown("---")
 st.caption(
     "Supervised NLP model (keyword features + Logistic Regression), trained on labeled Craigslist data. "
-    "Accurate, explainable, and deployment-ready."
 )
