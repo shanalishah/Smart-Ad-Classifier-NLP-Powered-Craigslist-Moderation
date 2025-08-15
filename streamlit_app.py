@@ -70,32 +70,23 @@ def load_pipeline() -> Pipeline:
 
 pipe = load_pipeline()
 
-# Determine which proba column corresponds to "computers" and build class-name mapping
-def resolve_label_mapping(pipeline: Pipeline):
+# Determine which proba column corresponds to "computers"
+def resolve_idx_pos(pipeline: Pipeline) -> int:
     clf = pipeline.named_steps["clf"]
     classes = list(getattr(clf, "classes_", []))
 
     # If labels are strings and include 'computers', use directly
     if classes and all(isinstance(c, str) for c in classes) and "computers" in classes:
-        idx_pos = classes.index("computers")
-        class_to_name = {c: c for c in classes}
-        return idx_pos, class_to_name
+        return classes.index("computers")
 
     # Otherwise infer via a quick probe
     probe_comp = ["apple macbook pro 16 inch", "dell xps 13 laptop"]
     probe_part = ["rtx 3060 graphics card", "corsair 750w psu power supply"]
     p_comp = pipeline.predict_proba(probe_comp).mean(axis=0)
     p_part = pipeline.predict_proba(probe_part).mean(axis=0)
-    idx_pos = int(np.argmax(p_comp - p_part))
+    return int(np.argmax(p_comp - p_part))
 
-    if len(classes) == 2:
-        other_idx = 1 - idx_pos
-        class_to_name = {classes[idx_pos]: "computers", classes[other_idx]: "computer_parts"}
-    else:
-        class_to_name = {0: "computer_parts", 1: "computers"}  # fallback
-    return idx_pos, class_to_name
-
-IDX_POS, CLASS_TO_NAME = resolve_label_mapping(pipe)
+IDX_POS = resolve_idx_pos(pipe)
 
 # ------------------------
 # APP TITLE & INTRO
@@ -126,12 +117,10 @@ def detect_plurality(text: str) -> bool:
         return True
     return False
 
-def pluralize_label(base_label: str, is_plural: bool) -> str:
-    if base_label == "computers":
+def pluralize(is_computer: bool, is_plural: bool) -> str:
+    if is_computer:
         return "Computers" if is_plural else "Computer"
-    if base_label == "computer_parts":
-        return "Computer Parts" if is_plural else "Computer Part"
-    return base_label
+    return "Computer Parts" if is_plural else "Computer Part"
 
 # ------------------------
 # HELPERS
@@ -151,26 +140,16 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["text"].str.strip().ne("")].reset_index(drop=True)
     return out
 
-def map_labels(raw_preds):
-    return [CLASS_TO_NAME.get(p, str(p)) for p in raw_preds]
-
-def predict_with_conf(texts: List[str]) -> pd.DataFrame:
-    raw = pipe.predict(texts)
-    base = map_labels(raw)
-
-    if hasattr(pipe.named_steps["clf"], "predict_proba"):
-        proba = pipe.predict_proba(texts)
-        p_comp = proba[:, IDX_POS]
-        conf = np.where(np.array(base) == "computers", p_comp, 1.0 - p_comp)
-    else:
-        conf = np.full(len(texts), 0.75, dtype=float)
-
-    # Singular vs plural display
-    adjusted = [pluralize_label(lbl, detect_plurality(txt)) for lbl, txt in zip(base, texts)]
+def classify_texts(texts: List[str], threshold: float) -> pd.DataFrame:
+    """Use probabilities only. p(computers) >= threshold -> Computer(s) else Computer Part(s)."""
+    proba = pipe.predict_proba(texts)[:, IDX_POS]  # p(computers)
+    is_comp = proba >= threshold
+    labels = [pluralize(bool(c), detect_plurality(t)) for c, t in zip(is_comp, texts)]
+    conf = np.where(is_comp, proba, 1.0 - proba)
 
     return pd.DataFrame({
         "text": texts,
-        "predicted_label": adjusted,
+        "predicted_label": labels,
         "confidence": np.round(conf, 3)
     })
 
@@ -185,6 +164,7 @@ tab1, tab2 = st.tabs(["💬 Quick Test", "📂 Bulk Classification (CSV)"])
 with tab1:
     st.subheader("Quick Test – Classify a Single Listing")
     st.markdown("Enter a product title or description to see the predicted category and confidence.")
+    threshold_demo = st.slider("Decision threshold (p = Computer)", 0.10, 0.90, 0.50, 0.01, key="thr_demo")
 
     user_input = st.text_area(
         "Listing text:",
@@ -193,7 +173,7 @@ with tab1:
 
     if st.button("Classify Listing", key="btn_single_classify"):
         if user_input.strip():
-            df_out = predict_with_conf([user_input])
+            df_out = classify_texts([user_input], threshold_demo)
             row = df_out.iloc[0]
             st.success(f"**Prediction:** {row['predicted_label']}")
             st.info(f"Confidence: {row['confidence']:.2%}")
@@ -206,6 +186,7 @@ with tab1:
 with tab2:
     st.subheader("Bulk Classification – Upload a CSV File")
     st.markdown("Upload a CSV with a **`text`** column (or **`title` + `description`**).")
+    threshold_bulk = st.slider("Decision threshold (p = Computer) for bulk", 0.10, 0.90, 0.50, 0.01, key="thr_bulk")
 
     uploaded_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_upload")
 
@@ -214,7 +195,7 @@ with tab2:
             df_raw = pd.read_csv(uploaded_file)
             df_in = normalize_input(df_raw)
 
-            df_out = predict_with_conf(df_in["text"].tolist())
+            df_out = classify_texts(df_in["text"].tolist(), threshold_bulk)
 
             show = pd.concat(
                 [df_in.reset_index(drop=True), df_out[["predicted_label", "confidence"]]],
@@ -239,6 +220,4 @@ with tab2:
 # FOOTER
 # ------------------------
 st.markdown("---")
-st.caption(
-    "Supervised NLP model (keyword features + Logistic Regression), trained on labeled Craigslist data. "
-)
+st.caption("Supervised NLP model (keyword features + Logistic Regression), trained on labeled Craigslist data.")
