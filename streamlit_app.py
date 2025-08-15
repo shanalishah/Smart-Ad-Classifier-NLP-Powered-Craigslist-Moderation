@@ -1,4 +1,4 @@
-# streamlit_app.py — Smart Ad Classifier (showcase-ready, using your saved keyword model)
+# streamlit_app.py — Smart Ad Classifier (showcase-ready; uses your saved 25-keyword LR model)
 from __future__ import annotations
 import numpy as np
 import pandas as pd
@@ -9,17 +9,18 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 
 # ---------------------------
-# Page setup & minimal styling
+# Page setup & light style
 # ---------------------------
 st.set_page_config(page_title="Smart Ad Classifier — Computers vs Computer Parts", layout="wide")
 st.markdown(
     """
     <style>
-      .smallcaps {font-variant: small-caps; letter-spacing: .03em;}
+      .smallcaps {font-variant: small-caps; letter-spacing:.03em;}
       .subtle {color:#6b7280;}
       .badge {display:inline-block; padding:4px 10px; border-radius:999px; font-size:0.85rem;}
       .badge-ok {background:#ecfdf5;}
       .badge-warn {background:#fff7ed;}
+      .result {padding:10px 12px; border:1px solid #eee; border-radius:12px; margin-bottom:8px;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -28,7 +29,7 @@ st.title("Smart Ad Classifier")
 st.markdown('<div class="subtle smallcaps">Automated moderation for marketplace listings</div>', unsafe_allow_html=True)
 
 # ---------------------------
-# Your original 25 keywords (order MUST match training)
+# Your 25 training keywords (ORDER matters; keep as in training)
 # ---------------------------
 KEYWORDS = [
     "laptop","dell","gaming","intel","core","window","pc","gb","ssd","latitude",
@@ -38,7 +39,7 @@ KEYWORDS = [
 N_FEATS = len(KEYWORDS)
 
 class KeywordFeaturizer(BaseEstimator, TransformerMixin):
-    """Rebuild the exact 25 binary features used at training time."""
+    """Recreate the exact 25 binary features your LR was trained on."""
     def __init__(self, keywords):
         self.keywords = list(keywords)
     def fit(self, X, y=None):
@@ -51,106 +52,71 @@ class KeywordFeaturizer(BaseEstimator, TransformerMixin):
         return np.asarray(feats, dtype=np.float32)
 
 # ---------------------------
-# Load your saved LogisticRegression
+# Load your saved model
 # ---------------------------
 MODEL_PATH = Path("models/final_logistic_model.pkl")
 
 @st.cache_resource
-def load_pipeline():
+def load_pipeline_and_meta():
     if not MODEL_PATH.exists():
         st.error("`models/final_logistic_model.pkl` not found.")
         st.stop()
     clf = joblib.load(MODEL_PATH)
-
-    # Sanity: it should have been trained on 25 features
     n_in = getattr(clf, "n_features_in_", None)
     if n_in is not None and n_in != N_FEATS:
-        st.error(f"Loaded model expects {n_in} features, but the keyword featurizer provides {N_FEATS}. "
-                 "Please use the original model trained on 25 keywords.")
+        st.error(f"Loaded model expects {n_in} features, but this app provides {N_FEATS}. "
+                 "Use the LR model trained on 25 keywords.")
         st.stop()
+    pipe = Pipeline([("kw", KeywordFeaturizer(KEYWORDS)), ("clf", clf)])
 
-    # Build a runtime pipeline: features → classifier
-    return Pipeline([("kw", KeywordFeaturizer(KEYWORDS)), ("clf", clf)])
-
-pipe = load_pipeline()
-clf = pipe.named_steps["clf"]
-
-# Figure out label names and positive class index
-classes = getattr(clf, "classes_", None)
-if classes is None:
-    # Fallback: assume binary {0,1} where 1 = computers
-    CLASS_MAP = {0: "computer_parts", 1: "computers"}
-else:
-    # If strings already present, use them; otherwise infer
-    if all(isinstance(c, str) for c in classes) and set(classes) == {"computers", "computer_parts"}:
-        CLASS_MAP = {c: c for c in classes}
+    # Determine which probability column corresponds to 'computers' (robustly)
+    if hasattr(clf, "classes_"):
+        classes = list(clf.classes_)
     else:
-        # Probe to infer mapping
+        classes = [0, 1]  # fallback
+
+    # If classes are already correct strings:
+    if all(isinstance(c, str) for c in classes) and "computers" in classes:
+        idx_pos = classes.index("computers")
+    else:
+        # Infer via a quick probe: computers text should get higher prob in the positive column
         probe_comp = ["apple macbook pro 16 inch", "dell xps 13 laptop"]
-        probe_part = ["rtx 3060 graphics card", "corsair 750w psu"]
-        y_comp = pipe.predict(probe_comp)
-        uniq = list(classes)
-        score = {uniq[0]: (y_comp == uniq[0]).sum(), uniq[1]: (y_comp == uniq[1]).sum()}
-        comp_id = max(score, key=score.get)
-        part_id = uniq[0] if comp_id == uniq[1] else uniq[1]
-        CLASS_MAP = {comp_id: "computers", part_id: "computer_parts"}
+        probe_part = ["rtx 3060 graphics card", "corsair 750w psu power supply"]
+        p_comp = pipe.predict_proba(probe_comp).mean(axis=0)
+        p_part = pipe.predict_proba(probe_part).mean(axis=0)
+        # pick the column that prefers 'comp' over 'part'
+        diffs = p_comp - p_part
+        idx_pos = int(np.argmax(diffs))
 
-# Helper: map raw preds to canonical strings
-def to_labels(raw_preds):
-    return [CLASS_MAP.get(p, str(p)) for p in raw_preds]
+    return pipe, idx_pos
 
-# Compute confidence as probability of the chosen class
-def confidences(texts, labels):
-    if hasattr(clf, "predict_proba"):
-        probs = pipe.predict_proba(texts)
-        # Proba column for "computers"
-        if all(isinstance(c, str) for c in classes or []):
-            idx_comp = list(classes).index("computers") if "computers" in classes else 1
-        else:
-            # If classes are not strings, derive from CLASS_MAP
-            # Find the index in classes that maps to "computers"
-            idx_comp = 1 if CLASS_MAP.get(classes[1], None) == "computers" else 0
-        p_comp = probs[:, idx_comp]
-        conf = np.where(np.array(labels) == "computers", p_comp, 1.0 - p_comp)
-        return conf
-    return np.full(len(texts), 0.75, dtype=float)
-
-# Explainability: show keyword contributions (present keywords × LR weights)
-def explain_rows(texts):
-    feats = pipe.named_steps["kw"].transform(texts)        # (n, 25)
-    coef = clf.coef_[0]                                    # binary LR => (1, n_features)
-    rows = []
-    for i, s in enumerate(texts):
-        present = np.where(feats[i] == 1)[0]
-        contribs = [(KEYWORDS[j], float(coef[j])) for j in present]
-        contribs_sorted = sorted(contribs, key=lambda x: abs(x[1]), reverse=True)
-        rows.append(contribs_sorted[:8])  # top 8 contributions for readability
-    return rows
+pipe, IDX_POS = load_pipeline_and_meta()
+POS_NAME, NEG_NAME = "computers", "computer_parts"
 
 # ---------------------------
-# Sidebar — concise project context
+# Sidebar — brief context for recruiters
 # ---------------------------
 with st.sidebar:
-    st.header("About this project")
+    st.header("Project summary")
     st.markdown(
         """
-        **Goal**  
+        **Objective**  
         Automatically separate full **computers** from **computer parts/accessories** in marketplace listings.
 
-        **Approach**  
-        Lightweight NLP classifier: keyword-based features (25 signals) → Logistic Regression.
-        
-        **Why it matters**  
+        **Method**  
+        Lightweight NLP classifier: 25 keyword signals → Logistic Regression.
+
+        **Impact**  
         - Cleaner search results  
         - Less manual moderation  
         - Adaptable to other categories
         """
     )
     st.markdown("---")
-    st.caption("Note: This demo loads a pre-trained model and does not store any user data.")
+    st.caption("This demo loads a pre-trained model and does not store any user data.")
 
 # ---------------------------
-# Reusable helpers
+# Helpers
 # ---------------------------
 def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     cols = {c.lower(): c for c in df.columns}
@@ -165,13 +131,21 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["text"].str.strip().ne("")].reset_index(drop=True)
     return out
 
-def run_predictions(texts, flag_threshold=0.65):
-    raw = pipe.predict(texts)
-    labels = to_labels(raw)
-    conf = confidences(texts, labels).round(3)
-    df = pd.DataFrame({"text": texts, "predicted_label": labels, "confidence": conf})
-    df["flag_low_conf"] = df["confidence"] < flag_threshold
-    return df
+def classify_with_conf(texts, threshold: float):
+    probs = pipe.predict_proba(texts)[:, IDX_POS]
+    preds = np.where(probs >= threshold, POS_NAME, NEG_NAME)
+    conf = np.where(preds == POS_NAME, probs, 1.0 - probs)
+    return preds, conf
+
+def explain_keywords(texts):
+    feats = pipe.named_steps["kw"].transform(texts)  # (n, 25)
+    coef = pipe.named_steps["clf"].coef_[0]          # binary LR => (1, n_features)
+    rows = []
+    for i in range(len(texts)):
+        present_idx = np.where(feats[i] == 1)[0]
+        contribs = [(KEYWORDS[j], float(coef[j])) for j in present_idx]
+        rows.append(sorted(contribs, key=lambda x: abs(x[1]), reverse=True)[:8])
+    return rows
 
 # ---------------------------
 # Tabs: Demo | Batch | Explainability
@@ -189,35 +163,30 @@ with tab_demo:
         "Corsair 750W PSU power supply\n"
     )
     user_text = st.text_area("Listings", value=samples, height=180, key="ta_demo")
-    flag_thresh = st.slider("Flag if confidence below", 0.50, 0.95, 0.65, 0.01, key="thr_demo")
+    threshold = st.slider("Decision threshold (p=computers)", 0.10, 0.90, 0.50, 0.01, key="thr_demo")
 
     if st.button("Classify", type="primary", key="btn_demo"):
         lines = [ln.strip() for ln in user_text.splitlines() if ln.strip()]
         if not lines:
             st.warning("Please enter at least one line.")
         else:
-            df_out = run_predictions(lines, flag_threshold=flag_thresh)
-            # Nicely formatted results
-            for _, row in df_out.iterrows():
-                badge_cls = "badge-ok" if row["predicted_label"] == "computers" else "badge-warn"
+            preds, conf = classify_with_conf(lines, threshold)
+            df_out = pd.DataFrame({"text": lines, "predicted_label": preds, "confidence": conf.round(3)})
+
+            for _, r in df_out.iterrows():
+                badge = "badge-ok" if r["predicted_label"] == POS_NAME else "badge-warn"
                 st.markdown(
-                    f'<span class="badge {badge_cls}">{row["predicted_label"]}</span> '
-                    f'**{row["confidence"]:.2f}** — {row["text"]}',
-                    unsafe_allow_html=True,
+                    f'<div class="result"><span class="badge {badge}">{r["predicted_label"]}</span> '
+                    f'<strong>{r["confidence"]:.2f}</strong> — {r["text"]}</div>',
+                    unsafe_allow_html=True
                 )
-            st.download_button(
-                "Download results (CSV)",
-                df_out.to_csv(index=False),
-                "predictions.csv",
-                key="dl_demo",
-            )
+            st.download_button("Download results (CSV)", df_out.to_csv(index=False), "predictions.csv", key="dl_demo")
 
 # --- Batch tab
 with tab_batch:
     st.subheader("Batch Classification (CSV)")
     st.caption("Upload a CSV with a **text** column (or **title** + **description**).")
     uploaded = st.file_uploader("Upload CSV", type=["csv"], key="uploader")
-    # Provide a tiny sample file for convenience
     sample = pd.DataFrame({
         "text": [
             "Apple iMac 27-inch 2019 i5 16GB 512GB",
@@ -231,31 +200,36 @@ with tab_batch:
     if uploaded is not None:
         df_raw = pd.read_csv(uploaded)
         df_in = normalize_input(df_raw)
-        df_out = run_predictions(df_in["text"].tolist(), flag_threshold=0.65)
+        preds, conf = classify_with_conf(df_in["text"].tolist(), threshold=0.50)
+        df_out = df_in.copy()
+        df_out["predicted_label"] = preds
+        df_out["confidence"] = np.round(conf, 3)
         st.dataframe(df_out, use_container_width=True)
         st.download_button("Download results (CSV)", df_out.to_csv(index=False), "predictions.csv", key="dl_batch")
+    else:
+        st.info("No file uploaded yet.")
 
 # --- Explainability tab
 with tab_explain:
     st.subheader("Keyword Signals Detected")
-    st.caption("For each listing, we show the keywords (from the 25 training features) found in the text, "
-               "and their contribution sign based on the model’s coefficients.")
+    st.caption("We show the training keywords found in each listing and the direction of their contribution.")
     txt = st.text_area("Enter one listing per line:", height=160, key="ta_explain")
     if st.button("Analyze keywords", key="btn_explain"):
         lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
         if not lines:
             st.warning("Please enter at least one line.")
         else:
-            df_pred = run_predictions(lines)
-            rows = explain_rows(lines)
+            preds, conf = classify_with_conf(lines, threshold=0.50)
+            contrib_rows = explain_keywords(lines)
             for i, line in enumerate(lines):
                 st.markdown(f"**Text:** {line}")
+                badge = "badge-ok" if preds[i] == POS_NAME else "badge-warn"
                 st.markdown(
-                    f'Prediction: <span class="badge badge-ok">{df_pred.loc[i,"predicted_label"]}</span> '
-                    f'&nbsp;&middot;&nbsp; Confidence: **{df_pred.loc[i,"confidence"]:.2f}**',
+                    f'Prediction: <span class="badge {badge}">{preds[i]}</span> '
+                    f'&nbsp;·&nbsp; Confidence: **{conf[i]:.2f}**',
                     unsafe_allow_html=True
                 )
-                contribs = rows[i]
+                contribs = contrib_rows[i]
                 if not contribs:
                     st.caption("No training keywords detected in this text.")
                 else:
