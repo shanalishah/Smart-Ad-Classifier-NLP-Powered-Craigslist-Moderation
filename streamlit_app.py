@@ -1,9 +1,11 @@
+import re
+from pathlib import Path
+from typing import List
+
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-import joblib
-from pathlib import Path
-from typing import List
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 
@@ -16,7 +18,7 @@ st.set_page_config(
 )
 
 # ------------------------
-# MODEL PATH
+# MODEL PATH (your saved LR trained on 25 keywords)
 # ------------------------
 MODEL_PATH = Path("models/final_logistic_model.pkl")
 
@@ -56,8 +58,10 @@ def load_pipeline() -> Pipeline:
 
     n_in = getattr(clf, "n_features_in_", None)
     if n_in is not None and n_in != N_FEATS:
-        st.error(f"Loaded model expects {n_in} features, but this app provides {N_FEATS}. "
-                 "Use the LR model trained on the 25 keyword features.")
+        st.error(
+            f"Loaded model expects {n_in} features, but this app provides {N_FEATS}. "
+            "Use the LR model trained on the 25 keyword features."
+        )
         st.stop()
 
     pipe = Pipeline([("kw", KeywordFeaturizer(KEYWORDS)), ("clf", clf)])
@@ -66,36 +70,29 @@ def load_pipeline() -> Pipeline:
 
 pipe = load_pipeline()
 
-# Determine which proba column = "computers" and build a mapping for labels
+# Determine which proba column corresponds to "computers" and build class-name mapping
 def resolve_label_mapping(pipeline: Pipeline):
     clf = pipeline.named_steps["clf"]
     classes = list(getattr(clf, "classes_", []))
 
-    # If already string labels and includes 'computers', use that directly
+    # If labels are strings and include 'computers', use directly
     if classes and all(isinstance(c, str) for c in classes) and "computers" in classes:
         idx_pos = classes.index("computers")
         class_to_name = {c: c for c in classes}
         return idx_pos, class_to_name
 
-    # Otherwise, infer via a quick probe
+    # Otherwise infer via a quick probe
     probe_comp = ["apple macbook pro 16 inch", "dell xps 13 laptop"]
     probe_part = ["rtx 3060 graphics card", "corsair 750w psu power supply"]
     p_comp = pipeline.predict_proba(probe_comp).mean(axis=0)
     p_part = pipeline.predict_proba(probe_part).mean(axis=0)
-    diffs = p_comp - p_part
-    idx_pos = int(np.argmax(diffs))  # column more confident on computers than parts
+    idx_pos = int(np.argmax(p_comp - p_part))
 
-    # Map raw class IDs to human-friendly names
-    # The class at idx_pos is "computers"; the other is "computer_parts"
     if len(classes) == 2:
         other_idx = 1 - idx_pos
-        class_to_name = {
-            classes[idx_pos]: "computers",
-            classes[other_idx]: "computer_parts",
-        }
+        class_to_name = {classes[idx_pos]: "computers", classes[other_idx]: "computer_parts"}
     else:
-        # Fallback if classes missing: assume 2 classes [0,1]
-        class_to_name = {0: "computer_parts", 1: "computers"}
+        class_to_name = {0: "computer_parts", 1: "computers"}  # fallback
     return idx_pos, class_to_name
 
 IDX_POS, CLASS_TO_NAME = resolve_label_mapping(pipe)
@@ -106,10 +103,35 @@ IDX_POS, CLASS_TO_NAME = resolve_label_mapping(pipe)
 st.title("Smart Ad Classifier – Craigslist Computer Listings")
 st.markdown(
     """
-    Classifies Craigslist listings into **Computer** or **Computer Part** using a 
+    Classifies Craigslist listings into **Computer** or **Computer Part** using a
     supervised NLP model trained on real marketplace data.
     """
 )
+
+# ------------------------
+# PLURALITY HANDLING
+# ------------------------
+PLURAL_HINTS = [
+    "multiple", "lot of", "lots of", "variety of", "assorted", "bundle of",
+    "pair of", "pairs of", "two", "three", "four", "several", "many",
+    "pcs", "pieces", "units", "items", "bulk"
+]
+PLURAL_NOUNS = r"\b(computers|laptops|desktops|monitors|keyboards|mice|routers|printers|drives|cables|adapters)\b"
+
+def detect_plurality(text: str) -> bool:
+    t = (text or "").lower()
+    if any(h in t for h in PLURAL_HINTS):
+        return True
+    if re.search(PLURAL_NOUNS, t):
+        return True
+    return False
+
+def pluralize_label(base_label: str, is_plural: bool) -> str:
+    if base_label == "computers":
+        return "Computers" if is_plural else "Computer"
+    if base_label == "computer_parts":
+        return "Computer Parts" if is_plural else "Computer Part"
+    return base_label
 
 # ------------------------
 # HELPERS
@@ -130,23 +152,25 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def map_labels(raw_preds):
-    # Convert model's raw labels (e.g., 0/1) to strings using CLASS_TO_NAME
     return [CLASS_TO_NAME.get(p, str(p)) for p in raw_preds]
 
 def predict_with_conf(texts: List[str]) -> pd.DataFrame:
     raw = pipe.predict(texts)
-    preds = map_labels(raw)
+    base = map_labels(raw)
 
     if hasattr(pipe.named_steps["clf"], "predict_proba"):
         proba = pipe.predict_proba(texts)
         p_comp = proba[:, IDX_POS]
-        conf = np.where(np.array(preds) == "computers", p_comp, 1.0 - p_comp)
+        conf = np.where(np.array(base) == "computers", p_comp, 1.0 - p_comp)
     else:
         conf = np.full(len(texts), 0.75, dtype=float)
 
+    # Singular vs plural display
+    adjusted = [pluralize_label(lbl, detect_plurality(txt)) for lbl, txt in zip(base, texts)]
+
     return pd.DataFrame({
         "text": texts,
-        "predicted_label": preds,
+        "predicted_label": adjusted,
         "confidence": np.round(conf, 3)
     })
 
