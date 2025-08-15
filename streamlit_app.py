@@ -139,7 +139,7 @@ def _keyword_stub_predict(texts):
 # ---------------- UI ----------------
 pipe, trained_rows = _load_or_train_pipeline()
 
-tab_try, tab_bulk = st.tabs(["Try it now", "Bulk classify (CSV)"])
+tab_try, tab_bulk = st.tabs(["Try it now", "Bulk Classify (CSV)"])
 
 with tab_try:
     st.subheader("Try it now")
@@ -177,7 +177,7 @@ with tab_try:
             st.download_button("Download predictions", df_out.to_csv(index=False), "predictions.csv", mime="text/csv")
 
 with tab_bulk:
-    st.subheader("Bulk classify (CSV)")
+    st.subheader("Bulk Classify (CSV)")
     uploaded = st.file_uploader(
         "Upload a CSV",
         type=["csv"],
