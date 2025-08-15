@@ -1,51 +1,126 @@
-# streamlit_app.py — Smart Ad Classifier (professional UI; uses your 25-keyword LR model)
-from __future__ import annotations
-from pathlib import Path
-from typing import Optional, Tuple
-
-import joblib
-import numpy as np
-import pandas as pd
+# streamlit_app.py — Smart Ad Classifier
 import streamlit as st
-from sklearn.base import BaseEstimator, TransformerMixin
+import pandas as pd
+import joblib, pickle
+from pathlib import Path
+from typing import Optional, Tuple, Any
 from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
 
-# ---------------- Page setup ----------------
 st.set_page_config(page_title="Smart Ad Classifier", layout="wide")
 st.title("Smart Ad Classifier – Computers vs Computer Parts")
 st.write(
-    "Paste a listing (or several, one per line) to classify whether it describes a "
-    "**Computer** or a **Computer Part**. You can also upload a CSV on the second tab."
+    "Paste listings (one per line) to classify whether they describe a **Computer** or a **Computer Part**. "
+    "Or upload a CSV on the second tab."
 )
 
-# ---------------- Paths ----------------
-MODEL_DIR = Path("models")
-MODEL_PATH = MODEL_DIR / "final_logistic_model.pkl"   # your saved LR model (trained on 25 keywords)
+# ---------- Paths ----------
+ROOT = Path(".")
+MODEL_PIPELINE = ROOT / "pipeline_lr_tfidf.joblib"  # optional single-file pipeline
+MODELS_DIR = ROOT / "models"
+VEC_PKL = MODELS_DIR / "tfidf_vectorizer.pkl"       # your uploaded file
+CLF_PKL = MODELS_DIR / "final_logistic_model.pkl"   # your uploaded file
 
-# ---------------- Keyword feature maker (ORDER must match training!) ----------------
-KEYWORDS = [
-    "laptop","dell","gaming","intel","core","window","pc","gb","ssd","latitude",
-    "keyboard","ram","computer","mouse","mac","graphic","ryzen","monitor","cable",
-    "printer","hp","router","cartridge","ink","drive"
-]
-N_FEATS = len(KEYWORDS)
+DATA = ROOT / "data"
+HUMAN = DATA / "labeled_and_flagged_with_human_check.csv"  # optional
+CLEAN = DATA / "clean_dedup_labeled.csv"                   # optional
 
-class KeywordFeaturizer(BaseEstimator, TransformerMixin):
-    """Recreate the exact 25 binary features your LR was trained on."""
-    def __init__(self, keywords):
-        self.keywords = list(keywords)
-    def fit(self, X, y=None):
-        return self
-    def transform(self, X):
-        feats = []
-        for t in X:
-            s = str(t).lower()
-            feats.append([1 if k in s else 0 for k in self.keywords])
-        return np.asarray(feats, dtype=np.float32)
+# ---------- Safe loaders & validators ----------
+def _try_joblib_or_pickle(path: Path) -> Any:
+    try:
+        return joblib.load(path)
+    except Exception:
+        with open(path, "rb") as f:
+            return pickle.load(f)
 
-# ---------------- Helpers ----------------
+def _is_valid_vectorizer(v) -> bool:
+    # Must have transform(); for TF-IDF, vocabulary_ should exist
+    return hasattr(v, "transform") and (hasattr(v, "vocabulary_") or hasattr(v, "get_feature_names_out"))
+
+def _is_valid_classifier(c) -> bool:
+    # Must have predict(); predict_proba is nice-to-have
+    return hasattr(c, "predict")
+
+# ---------- Label loading / cleaning ----------
+@st.cache_data(show_spinner=False)
+def _load_labels() -> Optional[pd.DataFrame]:
+    path = CLEAN if CLEAN.exists() else (HUMAN if HUMAN.exists() else None)
+    if path is None:
+        return None
+    df = pd.read_csv(path)
+    df.columns = [c.lower() for c in df.columns]
+
+    # build text column
+    if "text" in df.columns:
+        text = df["text"].fillna("").astype(str)
+    elif {"title", "description"}.issubset(df.columns):
+        text = (df["title"].fillna("") + " " + df["description"].fillna("")).astype(str)
+    else:
+        return None
+
+    # choose one label column
+    if "human_label" in df.columns:
+        label = df["human_label"]
+    elif "label" in df.columns:
+        label = df["label"]
+    else:
+        return None
+
+    label = label.replace({"computer": "computers"}).astype(str)
+    out = pd.DataFrame({"text": text, "label": label})
+    out = out[out["text"].str.strip().ne("")]
+    out = out[out["label"].isin(["computers", "computer_parts"])].copy()
+    out = out.drop_duplicates(subset=["text"]).reset_index(drop=True)
+    return out if not out.empty else None
+
+# ---------- Load model in priority order ----------
+@st.cache_resource
+def _load_model() -> Tuple[Optional[Pipeline], Optional[int], str]:
+    """
+    Returns (pipeline_or_none, training_rows_if_trained_now, source_string)
+    Source is one of: 'pipeline', 'pickles', 'trained', 'none'
+    """
+    # 1) Single pipeline file (fastest)
+    if MODEL_PIPELINE.exists():
+        try:
+            pipe = joblib.load(MODEL_PIPELINE)
+            return pipe, None, "pipeline"
+        except Exception:
+            pass  # continue
+
+    # 2) Your pickles (vectorizer + classifier)
+    if VEC_PKL.exists() and CLF_PKL.exists():
+        try:
+            vec = _try_joblib_or_pickle(VEC_PKL)
+            clf = _try_joblib_or_pickle(CLF_PKL)
+            if _is_valid_vectorizer(vec) and _is_valid_classifier(clf):
+                pipe = Pipeline([("tfidf", vec), ("clf", clf)])
+                # quick smoke test to ensure transform works
+                _ = pipe.predict(["test"])
+                return pipe, None, "pickles"
+        except Exception:
+            pass  # fall through
+
+    # 3) Train from labeled CSV (if available)
+    df = _load_labels()
+    if df is not None and not df.empty:
+        pipe = Pipeline([
+            ("tfidf", TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=3000)),
+            ("clf", LogisticRegression(max_iter=200, solver="liblinear")),
+        ])
+        pipe.fit(df["text"], df["label"])
+        # best-effort save as pipeline for future fast loads
+        try:
+            joblib.dump(pipe, MODEL_PIPELINE)
+        except Exception:
+            pass
+        return pipe, len(df), "trained"
+
+    # 4) Nothing available
+    return None, None, "none"
+
 def _normalize_input(df: pd.DataFrame) -> pd.DataFrame:
-    """Accept 'text' OR ('title' + 'description') and return a clean DataFrame with 'text'."""
     cols = {c.lower(): c for c in df.columns}
     if "text" in cols:
         text = df[cols["text"]].fillna("").astype(str)
@@ -58,14 +133,10 @@ def _normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["text"].str.strip().ne("")].reset_index(drop=True)
     return out
 
-def _fallback_stub(texts: list[str]) -> Tuple[list[str], list[float]]:
-    """
-    Minimal heuristic so the demo still runs if the model file is missing.
-    (Used only as a graceful fallback; your real model is used when present.)
-    """
-    parts_kw = {"gpu","graphics card","monitor","keyboard","mouse","ssd","hdd","ram","memory",
-                "cpu","processor","motherboard","psu","power supply","cable","adapter","webcam"}
-    comps_kw = {"laptop","notebook","macbook","desktop","tower","gaming pc","prebuilt","computer"}
+def _keyword_stub_predict(texts):
+    parts_kw = {"gpu", "graphics card", "monitor", "keyboard", "mouse", "ssd", "hdd", "ram", "memory",
+                "cpu", "processor", "motherboard", "psu", "power supply", "cable", "adapter", "webcam"}
+    comps_kw = {"laptop", "notebook", "macbook", "desktop", "tower", "gaming pc", "prebuilt", "computer", "pc"}
     preds, probs = [], []
     for t in texts:
         s = t.lower()
@@ -81,26 +152,9 @@ def _fallback_stub(texts: list[str]) -> Tuple[list[str], list[float]]:
             preds.append("computer_parts"); probs.append(0.55)
     return preds, probs
 
-# ---------------- Load or build pipeline ----------------
-@st.cache_resource(show_spinner=False)
-def _load_pipeline() -> Optional[Pipeline]:
-    if not MODEL_PATH.exists():
-        return None
-    clf = joblib.load(MODEL_PATH)
+# ---------- Build UI ----------
+pipe, trained_rows, source = _load_model()
 
-    # Sanity-check: the model should expect 25 features (our keyword featurizer provides 25)
-    n_in = getattr(clf, "n_features_in_", None)
-    if n_in is not None and n_in != N_FEATS:
-        st.warning(
-            f"Loaded model expects {n_in} features, but this app provides {N_FEATS}. "
-            "If you trained on different features, rebuild the app to match."
-        )
-    # Wrap your LR in a pipeline with the KeywordFeaturizer so preprocessing matches training
-    return Pipeline([("kw", KeywordFeaturizer(KEYWORDS)), ("clf", clf)])
-
-pipe = _load_pipeline()
-
-# ---------------- Tabs ----------------
 tab_try, tab_bulk = st.tabs(["Try it now", "Bulk classify (CSV)"])
 
 with tab_try:
@@ -114,38 +168,24 @@ with tab_try:
     user_text = st.text_area(
         "Enter one listing per line:",
         height=160,
-        placeholder="e.g., RTX 3060 graphics card, 12GB GDDR6, new in box",
         value=default_examples,
+        placeholder="e.g., RTX 3060 graphics card, 12GB GDDR6, new in box",
     )
     flag_thresh = st.slider("Flag if confidence below", 0.50, 0.95, 0.65, 0.01)
 
-    if st.button("Classify", type="primary"):
+    if st.button("Classify"):
         lines = [ln.strip() for ln in user_text.splitlines() if ln.strip()]
         if not lines:
             st.warning("Please enter at least one line of text.")
         else:
-            if pipe is not None and hasattr(pipe.named_steps["clf"], "predict_proba"):
+            if pipe is not None:
                 preds = pipe.predict(lines)
-                proba = pipe.predict_proba(lines)
-                # Determine prob of 'computers' robustly for confidence
-                classes = list(pipe.named_steps["clf"].classes_)
-                if "computers" in classes:
-                    idx_comp = classes.index("computers")
-                else:
-                    # pick column with higher prob on 'computer-like' probes
-                    probe_comp = ["apple macbook pro 16 inch", "dell xps 13 laptop"]
-                    p_comp = pipe.predict_proba(probe_comp).mean(axis=0)
-                    idx_comp = int(np.argmax(p_comp))
-                p_comp = proba[:, idx_comp]
-                conf = np.where(preds == "computers", p_comp, 1.0 - p_comp)
-            elif pipe is not None:
-                # No predict_proba available; use a neutral confidence
-                preds = pipe.predict(lines)
-                conf = np.full(len(lines), 0.75, dtype=float)
+                conf = pipe.predict_proba(lines).max(axis=1)
             else:
-                preds, conf = _fallback_stub(lines)
+                preds, conf = _keyword_stub_predict(lines)
 
-            df_out = pd.DataFrame({"text": lines, "predicted_label": preds, "confidence": np.round(conf, 3)})
+            df_out = pd.DataFrame({"text": lines, "predicted_label": preds, "confidence": conf})
+            df_out["confidence"] = df_out["confidence"].round(3)
             df_out["flag_low_conf"] = df_out["confidence"] < flag_thresh
 
             st.subheader("Results")
@@ -159,28 +199,15 @@ with tab_bulk:
         type=["csv"],
         help="Use a single 'text' column or both 'title' and 'description'.",
     )
-
     if uploaded is not None:
         df_raw = pd.read_csv(uploaded)
         df_in = _normalize_input(df_raw)
 
-        if pipe is not None and hasattr(pipe.named_steps["clf"], "predict_proba"):
+        if pipe is not None:
             preds = pipe.predict(df_in["text"])
-            proba = pipe.predict_proba(df_in["text"])
-            classes = list(pipe.named_steps["clf"].classes_)
-            if "computers" in classes:
-                idx_comp = classes.index("computers")
-            else:
-                probe_comp = ["apple macbook pro 16 inch", "dell xps 13 laptop"]
-                p_comp = pipe.predict_proba(probe_comp).mean(axis=0)
-                idx_comp = int(np.argmax(p_comp))
-            p_comp = proba[:, idx_comp]
-            conf = np.where(preds == "computers", p_comp, 1.0 - p_comp)
-        elif pipe is not None:
-            preds = pipe.predict(df_in["text"])
-            conf = np.full(len(df_in), 0.75, dtype=float)
+            conf = pipe.predict_proba(df_in["text"]).max(axis=1)
         else:
-            preds, conf = _fallback_stub(df_in["text"].tolist())
+            preds, conf = _keyword_stub_predict(df_in["text"].tolist())
 
         df_out = df_in.copy()
         df_out["predicted_label"] = preds
@@ -190,9 +217,12 @@ with tab_bulk:
     else:
         st.info("No file uploaded yet.")
 
-# Discreet footer for a non-technical audience
-if pipe is not None:
-    st.caption("Pre-trained model loaded. (Keyword features → Logistic Regression)")
+# ---------- Discreet footer ----------
+if source == "pipeline":
+    st.caption("Pre-trained model loaded for instant results.")
+elif source == "pickles":
+    st.caption("Pre-trained vectorizer and classifier loaded from repository.")
+elif source == "trained" and trained_rows:
+    st.caption(f"Built and tested on {trained_rows} real Craigslist listings.")
 else:
-    st.caption("Demo fallback is shown because no model file was found.")
-    
+    st.caption("Interactive demo available without uploading a dataset.")
