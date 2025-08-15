@@ -54,7 +54,6 @@ def load_pipeline() -> Pipeline:
         st.stop()
     clf = joblib.load(MODEL_PATH)
 
-    # sanity: model should expect 25 features
     n_in = getattr(clf, "n_features_in_", None)
     if n_in is not None and n_in != N_FEATS:
         st.error(f"Loaded model expects {n_in} features, but this app provides {N_FEATS}. "
@@ -62,11 +61,44 @@ def load_pipeline() -> Pipeline:
         st.stop()
 
     pipe = Pipeline([("kw", KeywordFeaturizer(KEYWORDS)), ("clf", clf)])
-    # quick smoke test
     _ = pipe.predict(["sanity check"])
     return pipe
 
 pipe = load_pipeline()
+
+# Determine which proba column = "computers" and build a mapping for labels
+def resolve_label_mapping(pipeline: Pipeline):
+    clf = pipeline.named_steps["clf"]
+    classes = list(getattr(clf, "classes_", []))
+
+    # If already string labels and includes 'computers', use that directly
+    if classes and all(isinstance(c, str) for c in classes) and "computers" in classes:
+        idx_pos = classes.index("computers")
+        class_to_name = {c: c for c in classes}
+        return idx_pos, class_to_name
+
+    # Otherwise, infer via a quick probe
+    probe_comp = ["apple macbook pro 16 inch", "dell xps 13 laptop"]
+    probe_part = ["rtx 3060 graphics card", "corsair 750w psu power supply"]
+    p_comp = pipeline.predict_proba(probe_comp).mean(axis=0)
+    p_part = pipeline.predict_proba(probe_part).mean(axis=0)
+    diffs = p_comp - p_part
+    idx_pos = int(np.argmax(diffs))  # column more confident on computers than parts
+
+    # Map raw class IDs to human-friendly names
+    # The class at idx_pos is "computers"; the other is "computer_parts"
+    if len(classes) == 2:
+        other_idx = 1 - idx_pos
+        class_to_name = {
+            classes[idx_pos]: "computers",
+            classes[other_idx]: "computer_parts",
+        }
+    else:
+        # Fallback if classes missing: assume 2 classes [0,1]
+        class_to_name = {0: "computer_parts", 1: "computers"}
+    return idx_pos, class_to_name
+
+IDX_POS, CLASS_TO_NAME = resolve_label_mapping(pipe)
 
 # ------------------------
 # APP TITLE & INTRO
@@ -97,21 +129,18 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["text"].str.strip().ne("")].reset_index(drop=True)
     return out
 
-def predict_with_conf(texts: List[str]) -> pd.DataFrame:
-    # predictions
-    preds = pipe.predict(texts)
+def map_labels(raw_preds):
+    # Convert model's raw labels (e.g., 0/1) to strings using CLASS_TO_NAME
+    return [CLASS_TO_NAME.get(p, str(p)) for p in raw_preds]
 
-    # confidence (prefer predict_proba if available)
+def predict_with_conf(texts: List[str]) -> pd.DataFrame:
+    raw = pipe.predict(texts)
+    preds = map_labels(raw)
+
     if hasattr(pipe.named_steps["clf"], "predict_proba"):
         proba = pipe.predict_proba(texts)
-        # If the model has string classes with 'computers', use that column; else use max prob
-        classes = list(getattr(pipe.named_steps["clf"], "classes_", []))
-        if "computers" in classes:
-            idx_comp = classes.index("computers")
-            p_comp = proba[:, idx_comp]
-            conf = np.where(np.array(preds) == "computers", p_comp, 1.0 - p_comp)
-        else:
-            conf = proba.max(axis=1)
+        p_comp = proba[:, IDX_POS]
+        conf = np.where(np.array(preds) == "computers", p_comp, 1.0 - p_comp)
     else:
         conf = np.full(len(texts), 0.75, dtype=float)
 
@@ -163,7 +192,6 @@ with tab2:
 
             df_out = predict_with_conf(df_in["text"].tolist())
 
-            # show alongside source rows if useful
             show = pd.concat(
                 [df_in.reset_index(drop=True), df_out[["predicted_label", "confidence"]]],
                 axis=1
