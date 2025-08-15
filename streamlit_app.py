@@ -120,7 +120,7 @@ def pluralize(is_computer: bool, is_plural: bool) -> str:
     return "Computer Parts" if is_plural else "Computer Part"
 
 # ------------------------
-# HELPERS
+# CSV NORMALIZATION
 # ------------------------
 def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     """Accept 'text' OR ('title' + 'description') and return a clean DataFrame with 'text'."""
@@ -137,14 +137,20 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["text"].str.strip().ne("")].reset_index(drop=True)
     return out
 
-# --- Lexicons for gentle, human-readable nudges ---
+# ------------------------
+# RULE LAYER (NUDGE + OVERRIDE)
+# ------------------------
 PARTS_STRONG = {
-    "gpu","graphics card","video card","graphics","rtx","gtx","radeon",
+    # core parts/components
+    "gpu","graphics card","video card","rtx","gtx","radeon",
     "psu","power supply","motherboard","mainboard","cpu","processor","heatsink","cooler",
     "ram","memory","sodimm","ddr3","ddr4","ddr5",
     "ssd","hdd","hard drive","nvme","sata","m.2",
+    # peripherals/accessories
     "monitor","screen","keyboard","mouse","mice","printer","ink","toner",
-    "router","switch","cable","adapter","webcam","case","chassis","fan"
+    "router","switch","cable","adapter","webcam","case","chassis","fan",
+    # common brand+part phrases
+    "logitech mouse","logitech keyboard","razer mouse","razer keyboard","corsair psu"
 }
 COMPUTERS_STRONG = {
     "laptop","notebook","macbook","mac book","imac","mac mini","desktop","tower",
@@ -156,39 +162,65 @@ def _hit_any(text: str, vocab: set[str]) -> bool:
     return any(w in s for w in vocab)
 
 def _apply_prior_nudge(p_comp: np.ndarray, texts: list[str]) -> np.ndarray:
-    """
-    Adjust p(computers) slightly when we have a strong, unambiguous keyword signal.
-    - If looks like PART only -> nudge down (toward parts)
-    - If looks like COMPUTER only -> nudge up (toward computers)
-    Nudges are small so the model still dominates.
-    """
+    """Small nudges; model still dominates unless override triggers."""
     nudged = p_comp.copy()
     for i, t in enumerate(texts):
         part_hit = _hit_any(t, PARTS_STRONG)
         comp_hit = _hit_any(t, COMPUTERS_STRONG)
         if part_hit and not comp_hit:
-            nudged[i] = max(0.0, nudged[i] - 0.20)   # 20% nudge toward parts
+            nudged[i] = max(0.0, nudged[i] - 0.20)   # nudge toward parts
         elif comp_hit and not part_hit:
-            nudged[i] = min(1.0, nudged[i] + 0.20)   # 20% nudge toward computers
-        # both or neither -> no nudge
+            nudged[i] = min(1.0, nudged[i] + 0.20)   # nudge toward computers
     return nudged
 
+def _rule_override(text: str) -> str | None:
+    """
+    Hard override for very obvious cases:
+    - If strong PART and not strong COMPUTER -> force PARTS
+    - If strong COMPUTER and not strong PART -> force COMPUTERS
+    Return "parts", "computers", or None.
+    """
+    part_hit = _hit_any(text, PARTS_STRONG)
+    comp_hit = _hit_any(text, COMPUTERS_STRONG)
+    if part_hit and not comp_hit:
+        return "parts"
+    if comp_hit and not part_hit:
+        return "computers"
+    return None
+
+# ------------------------
+# CORE CLASSIFICATION (probabilities only)
+# ------------------------
 def classify_texts(texts: List[str], threshold: float) -> pd.DataFrame:
     """
-    Probabilities only. p(computers) is nudged by simple rules so obvious
-    items like 'mouse' flip earlier without needing an extreme threshold.
+    1) Get p(computers) from the model
+    2) Apply small nudges
+    3) Apply decisive override for obvious cases (e.g., 'mouse', 'keyboard')
+    4) Threshold to final label + singular/plural wording
     """
     p_comp_base = pipe.predict_proba(texts)[:, IDX_POS]  # base p(computers)
     p_comp = _apply_prior_nudge(p_comp_base, texts)
 
-    is_comp = p_comp >= threshold
-    labels = [pluralize(bool(c), detect_plurality(t)) for c, t in zip(is_comp, texts)]
-    conf = np.where(is_comp, p_comp, 1.0 - p_comp)
+    labels, confs = [], []
+    for t, p in zip(texts, p_comp):
+        override = _rule_override(t)
+        if override == "parts":
+            is_comp = False
+            conf = max(0.85, 1.0 - p)  # show high confidence without claiming 100%
+        elif override == "computers":
+            is_comp = True
+            conf = max(0.85, p)
+        else:
+            is_comp = p >= threshold
+            conf = p if is_comp else (1.0 - p)
+
+        labels.append(pluralize(is_comp, detect_plurality(t)))
+        confs.append(conf)
 
     return pd.DataFrame({
         "text": texts,
         "predicted_label": labels,
-        "confidence": np.round(conf, 3)
+        "confidence": np.round(np.array(confs), 3)
     })
 
 # ------------------------
