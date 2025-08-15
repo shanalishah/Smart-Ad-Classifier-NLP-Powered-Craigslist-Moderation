@@ -1,108 +1,84 @@
-# streamlit_app.py — Smart Ad Classifier (reuses your 25-keyword model)
+# streamlit_app.py — Smart Ad Classifier (uses your 25-keyword LR model)
 from __future__ import annotations
-import streamlit as st
-import pandas as pd
-import joblib, pickle
+import re
 from pathlib import Path
-from typing import List, Optional, Tuple
-import numpy as np
+from typing import List, Optional
 
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.pipeline import Pipeline
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
 
 # ------------------------
-# Page Configuration
+# Page configuration
 # ------------------------
 st.set_page_config(page_title="Smart Ad Classifier – Craigslist Listings", layout="wide")
 st.title("Smart Ad Classifier – Computers vs Computer Parts")
 st.write(
     "Paste listings (one per line) to classify whether they describe a **Computer** or a **Computer Part**. "
-    "You can also upload a CSV on the second tab."
+    "You can also upload a CSV in the second tab."
 )
 
 # ------------------------
-# Your keyword feature set (must match training)
+# Your original keyword set (25 features)
+# pulled from your notebook’s STEP 4
 # ------------------------
 KEYWORDS: List[str] = [
-    "laptop","dell","gaming","intel","core","window","pc","gb","ssd","latitude",
-    "keyboard","ram","computer","mouse","mac","graphic","ryzen","monitor","cable",
-    "printer","hp","router","cartridge","ink","drive"
+    "laptop","dell","gaming","intel","core","window","pc",
+    "gb","ssd","latitude","keyboard","ram","computer","mouse",
+    "mac","graphic","ryzen","monitor","cable","printer","hp","router",
+    "cartridge","ink","drive",
 ]
-N_FEATS = len(KEYWORDS)
-
-class KeywordFeaturizer(BaseEstimator, TransformerMixin):
-    """
-    Build the exact 25 binary features used in your final notebook.
-    For each keyword k in KEYWORDS: feature = int(k in text_lower)
-    """
-    def __init__(self, keywords: List[str]):
-        self.keywords = list(keywords)
-
-    def fit(self, X, y=None):
-        # nothing to learn — fixed feature set
-        return self
-
-    def transform(self, X):
-        # X is an iterable of raw text
-        feats = []
-        for t in X:
-            s = str(t).lower()
-            row = [1 if k in s else 0 for k in self.keywords]
-            feats.append(row)
-        return np.asarray(feats, dtype=np.float32)
+KW_COLS = [f"kw_{kw}" for kw in KEYWORDS]
 
 # ------------------------
-# Load your pickled LogisticRegression
+# Paths for your saved model
 # ------------------------
 ROOT = Path(".")
 MODEL_PATHS = [
-    ROOT / "models" / "final_logistic_model.pkl",
-    ROOT / "final_logistic_model.pkl",
+    ROOT / "models" / "final_logistic_model.pkl",   # preferred
+    ROOT / "data" / "final_logistic_model.pkl",     # fallback
+    ROOT / "final_logistic_model.pkl",              # last resort
 ]
 
-def load_clf() -> Optional[object]:
+@st.cache_resource
+def load_lr_model():
     for p in MODEL_PATHS:
         if p.exists():
-            try:
-                # Try joblib first, then pickle
-                try:
-                    clf = joblib.load(p)
-                except Exception:
-                    with open(p, "rb") as f:
-                        clf = pickle.load(f)
-                return clf
-            except Exception:
-                continue
-    return None
+            mdl = joblib.load(p)
+            # sanity: expect 25 input features and binary classes [0,1]
+            n_feat = getattr(mdl, "n_features_in_", None)
+            classes = getattr(mdl, "classes_", None)
+            if n_feat == len(KEYWORDS) and classes is not None and set(list(classes)) == {0,1}:
+                return mdl, str(p)
+    return None, None
 
-clf = load_clf()
-
-# Validate model file
-if clf is None:
-    st.error("Model file not found. Please add `models/final_logistic_model.pkl` to the repository.")
-    st.stop()
-
-# Your LR expects 25 features (from the notebook). Verify:
-n_in = getattr(clf, "n_features_in_", None)
-if n_in is not None and n_in != N_FEATS:
-    st.error(f"Loaded model expects {n_in} features, but the keyword featurizer provides {N_FEATS}. "
-             "Please ensure the uploaded model matches the 25-keyword feature set used in training.")
-    st.stop()
-
-# Build a runtime pipeline: [KeywordFeaturizer] -> [Your LogisticRegression]
-pipe = Pipeline([
-    ("kw", KeywordFeaturizer(KEYWORDS)),
-    ("clf", clf),
-])
+model, model_path = load_lr_model()
 
 # ------------------------
-# Helpers
+# Preprocessing & featureizer (exactly as in your notebook)
 # ------------------------
-def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
+def simple_clean(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", "", text)
+    return text.strip()
+
+def kw_features(texts: List[str]) -> np.ndarray:
+    """
+    Build the SAME 25-dim keyword presence features you trained the model on.
+    """
+    feats = np.zeros((len(texts), len(KEYWORDS)), dtype=np.int8)
+    for i, t in enumerate(texts):
+        s = simple_clean(t)
+        for j, kw in enumerate(KEYWORDS):
+            feats[i, j] = 1 if kw in s else 0
+    return feats
+
+def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
     cols = {c.lower(): c for c in df.columns}
     if "text" in cols:
         text = df[cols["text"]].fillna("").astype(str)
-    elif {"title", "description"}.issubset(set(cols)):
+    elif {"title","description"}.issubset(set(cols)):
         text = (df[cols["title"]].fillna("") + " " + df[cols["description"]].fillna("")).astype(str)
     else:
         st.error("Your file must contain a 'text' column OR both 'title' and 'description'.")
@@ -111,24 +87,28 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["text"].str.strip().ne("")].reset_index(drop=True)
     return out
 
+def decode_label(yhat: int) -> str:
+    # your mapping in notebook: computers -> 1, computer_parts -> 0
+    return "computers" if yhat == 1 else "computer_parts"
+
 # ------------------------
-# UI
+# Tabs
 # ------------------------
 tab_try, tab_bulk = st.tabs(["Try It Now", "Bulk Classification (CSV)"])
 
-# ---- Try It Now
+# ---- Tab: Try It Now
 with tab_try:
     st.subheader("Try It Now")
     default_examples = (
         "HP 24-inch monitor with HDMI, great condition\n"
         "Dell XPS 13 i7, 16GB RAM, 512GB SSD\n"
+        "Apple MacBook Pro 16-inch, M1, 16GB RAM\n"
         "RTX 3060 graphics card, 12GB GDDR6, new in box\n"
         "Gaming PC Ryzen 5 5600X, 16GB DDR4, 1TB NVMe\n"
-        "Apple MacBook Pro 16-inch, M1 Pro, 16GB RAM, 1TB SSD\n"
     )
     user_text = st.text_area(
         "Enter one listing per line:",
-        height=180,
+        height=160,
         value=default_examples,
         placeholder="e.g., Apple MacBook Air M2, 8GB RAM, 256GB SSD",
         key="ta_try",
@@ -139,18 +119,19 @@ with tab_try:
         lines = [ln.strip() for ln in user_text.splitlines() if ln.strip()]
         if not lines:
             st.warning("Please enter at least one line of text.")
+        elif model is None:
+            st.error("Model file not found or incompatible. Please add `final_logistic_model.pkl` to /models.")
         else:
-            preds = pipe.predict(lines)
-            # Note: your LR is binary (0/1). If it lacks predict_proba, synthesize via decision_function.
-            if hasattr(clf, "predict_proba"):
-                conf = pipe.predict_proba(lines).max(axis=1)
-            else:
-                # Fallback: uniform confidence; or compute from decision_function if available
-                conf = np.full(len(lines), 0.75, dtype=float)
+            X = kw_features(lines)
+            preds_raw = model.predict(X)
+            probs = model.predict_proba(X).max(axis=1)
 
-            labels = np.where(preds.astype(int) == 1, "computers", "computer_parts")
-            df_out = pd.DataFrame({"text": lines, "predicted_label": labels, "confidence": conf})
-            df_out["confidence"] = df_out["confidence"].astype(float).round(3)
+            labels = [decode_label(int(y)) for y in preds_raw]
+            df_out = pd.DataFrame({
+                "text": lines,
+                "predicted_label": labels,
+                "confidence": np.round(probs, 3),
+            })
             df_out["flag_low_conf"] = df_out["confidence"] < flag_thresh
 
             st.subheader("Results")
@@ -165,7 +146,7 @@ with tab_try:
                 key="dl_predictions_try",
             )
 
-# ---- Bulk CSV
+# ---- Tab: Bulk CSV
 with tab_bulk:
     st.subheader("Bulk Classification (CSV)")
     uploaded = st.file_uploader(
@@ -177,32 +158,35 @@ with tab_bulk:
 
     if uploaded is not None:
         df_raw = pd.read_csv(uploaded)
-        df_in = normalize_input(df_raw)
+        df_in = normalize_input_df(df_raw)
 
-        preds = pipe.predict(df_in["text"])
-        if hasattr(clf, "predict_proba"):
-            conf = pipe.predict_proba(df_in["text"]).max(axis=1)
+        if model is None:
+            st.error("Model file not found or incompatible. Please add `final_logistic_model.pkl` to /models.")
         else:
-            conf = np.full(len(df_in), 0.75, dtype=float)
+            X = kw_features(df_in["text"].tolist())
+            preds_raw = model.predict(X)
+            probs = model.predict_proba(X).max(axis=1)
 
-        labels = np.where(preds.astype(int) == 1, "computers", "computer_parts")
+            labels = [decode_label(int(y)) for y in preds_raw]
+            df_out = df_in.copy()
+            df_out["predicted_label"] = labels
+            df_out["confidence"] = np.round(probs, 3)
 
-        df_out = df_in.copy()
-        df_out["predicted_label"] = labels
-        df_out["confidence"] = pd.Series(conf, index=df_in.index).round(3)
+            st.dataframe(df_out, use_container_width=True)
 
-        st.dataframe(df_out, use_container_width=True)
-
-        csv_bulk = df_out.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Predictions",
-            data=csv_bulk,
-            file_name="predictions.csv",
-            mime="text/csv",
-            key="dl_predictions_bulk",
-        )
+            csv_bulk = df_out.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Predictions",
+                data=csv_bulk,
+                file_name="predictions.csv",
+                mime="text/csv",
+                key="dl_predictions_bulk",
+            )
     else:
         st.info("No file uploaded yet.")
 
-# ---- Footer
-st.caption("Pre-trained logistic model loaded with the original keyword features.")
+# ---- Footer (polite, non-technical)
+if model_path:
+    st.caption(f"Pre-trained model loaded from {model_path}.")
+else:
+    st.caption("Add the trained model file `final_logistic_model.pkl` to /models to enable predictions.")
