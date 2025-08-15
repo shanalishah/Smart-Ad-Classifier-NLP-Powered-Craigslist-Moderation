@@ -8,7 +8,7 @@ This project applies Natural Language Processing (NLP) to automatically classify
 - **TF-IDF vectorization** (unigrams + bigrams) for feature extraction.  
 - **Logistic Regression** model for accurate, interpretable classification.  
 - Confidence-based flagging of borderline cases for manual review.  
-- [Streamlit app](YOUR_STREAMLIT_LINK) for interactive predictions.  
+- [Streamlit app](https://smart-ad-classifier-nlp.streamlit.app) for interactive predictions.  
 
 ## Outcomes
 - **Cleaner Search Results** – Separates computers from accessories and parts, improving buyer experience.  
